@@ -5,7 +5,6 @@ services:
     plan: free
     buildCommand: npm install
     startCommand: node index.js
-    healthCheckPath: /api/status
     envVars:
             - key: OWNER_NUMBER
         value: 2347049397307
