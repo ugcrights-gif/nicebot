@@ -1,0 +1,14 @@
+services:
+    - type: web
+    name: nicebot
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node index.js
+    envVars:
+            - key: OWNER_NUMBER
+        value: 2347049397307
+            - key: BOT_TOKEN
+        sync: false
+            - key: AUTH_DIR
+        value: ./auth_state
