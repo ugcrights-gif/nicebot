@@ -1,19 +1,15 @@
 services:
-  - type: web
+    - type: web
     name: nicebot
     runtime: node
-    plan: starter
+    plan: free
     buildCommand: npm install
     startCommand: node index.js
     healthCheckPath: /api/status
-    disk:
-      name: auth-state
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
-      - key: OWNER_NUMBER
+            - key: OWNER_NUMBER
         value: 2347049397307
-      - key: BOT_TOKEN
+            - key: BOT_TOKEN
         sync: false
-      - key: AUTH_DIR
-        value: /var/data/auth_state
+            - key: AUTH_DIR
+        value: ./auth_state
