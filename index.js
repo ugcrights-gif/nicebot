@@ -19,13 +19,14 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+// Baileys 6.7.24 is ESM; dynamic import keeps this index.js compatible with CommonJS.
+async function main() {
 const {
   default: makeWASocket,
   useMultiFileAuthState,
-  fetchLatestBaileysVersion,
   DisconnectReason,
   Browsers,
-} = require('@whiskeysockets/baileys');
+} = await import('@whiskeysockets/baileys');
 
 const OWNER_NUMBER = process.env.OWNER_NUMBER || '2347049397307';
 const PORT = Number(process.env.PORT || 3001);
@@ -43,13 +44,13 @@ const state = {
   connected_at: null,
   error: '',
   commands: 0,
+  service_revision: 'pairing-lifecycle-2',
+  baileys_version: '6.7.24',
+  pairing_code_at: null,
+  last_disconnect_code: null,
 };
 
-let sock = null;
 let logs = [];
-let restarting = false;
-let pairingNumber = '';
-let pairingRequested = false;
 let commands = [];
 let commandsLoadedAt = null;
 
@@ -333,93 +334,198 @@ async function replyFor(text) {
   }
 }
 
-function scheduleRestart() {
-  if (restarting) return;
-  restarting = true;
-  setTimeout(async () => {
-    restarting = false;
-    try {
-      sock = null;
-      await startSocket();
-    } catch (error) {
-      state.error = String((error && error.message) || error);
-    }
-  }, 4000);
-}
 
-// WhatsApp signals it is ready to pair by emitting a QR event — even in
-// pairing-code mode. Requesting the code exactly on that event (instead of
-// a fixed delay) is what prevents the 428 / connection-closed errors.
-async function askForPairingCode() {
-  try {
-    const code = await sock.requestPairingCode(pairingNumber);
-    const clean = String(code || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
-    state.pairing_code = clean.length === 8 ? clean.slice(0, 4) + '-' + clean.slice(4) : clean;
-    state.status = 'pairing';
-    state.error = '';
-    console.log('Pairing code for ' + pairingNumber + ': ' + state.pairing_code);
-  } catch (error) {
-    pairingRequested = false;
-    state.error = 'Could not get a pairing code — trying again on the next attempt.';
-    console.error('requestPairingCode failed:', String((error && error.message) || error));
+function createWhatsAppConnection() {
+  let current = null;
+  let starting = null;
+  let restartTimer = null;
+  let pendingNumber = '';
+  let codeRequested = false;
+  let pairOperation = null;
+  let credentialWrites = Promise.resolve();
+  let generation = 0;
+  const hasIdentity = (creds) => Boolean(creds.registered || (creds.me && creds.me.id));
+  const clearCode = () => { state.pairing_code = ''; state.pairing_code_at = null; };
+  const fail = (error) => {
+    state.status = 'disconnected';
+    clearCode();
+    state.error = String((error && error.message) || error);
+    console.error('WhatsApp connection failed:', state.error);
+  };
+
+  function scheduleRestart(delay) {
+    if (restartTimer) return;
+    restartTimer = setTimeout(() => {
+      restartTimer = null;
+      start().catch(fail);
+    }, delay);
   }
-}
 
-async function startSocket() {
-  const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
-  let version;
-  try {
-    version = (await fetchLatestBaileysVersion()).version;
-  } catch (error) {}
-  sock = makeWASocket({
-    auth: authState,
-    version: version,
-    printQRInTerminal: false,
-    browser: Browsers.ubuntu('Chrome'),
-    syncFullHistory: false,
-    markOnlineOnConnect: false,
-    logger: silentLogger(),
-  });
-
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('connection.update', (update) => {
-    if (update.connection === 'connecting') state.status = 'connecting';
-    if (update.connection === 'open') {
-      state.status = 'connected';
-      state.connected_at = new Date().toISOString();
-      state.pairing_code = '';
-      state.error = '';
-      pairingNumber = '';
-      pairingRequested = false;
-      console.log('NiceBot is connected as ' + state.owner_number);
-    }
-    if (update.connection === 'close') {
-      const disconnect = update.lastDisconnect || {};
-      const statusCode =
-        disconnect.error && disconnect.error.output ? disconnect.error.output.statusCode : undefined;
-      state.status = 'disconnected';
-      state.connected_at = null;
-      pairingRequested = false;
-      if (!sock) return;
-      if (statusCode === DisconnectReason.loggedOut) {
-        state.error = 'This device was logged out of WhatsApp — clear the session and pair again.';
-        sock = null;
-        try {
-          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-        } catch (error) {}
+  async function stop(unlink) {
+    generation += 1;
+    clearTimeout(restartTimer);
+    restartTimer = null;
+    pendingNumber = '';
+    clearCode();
+    const previous = current;
+    current = null; // Ignore late events before ending the old socket.
+    if (starting) await starting;
+    await credentialWrites;
+    if (previous) {
+      if (unlink && hasIdentity(previous.authState.creds)) {
+        await previous.logout();
       } else {
-        state.error = 'Connection closed — reconnecting…';
-        scheduleRestart();
+        previous.end(new Error('Pairing session closed locally.'));
       }
     }
-    if (update.qr && pairingNumber && !pairingRequested) {
-      pairingRequested = true;
-      askForPairingCode();
-    }
-  });
+  }
 
-  sock.ev.on('messages.upsert', async (payload) => {
+  async function start() {
+    if (current) return current;
+    if (starting) return starting;
+    const epoch = generation;
+    starting = (async () => {
+      await credentialWrites; // A 515 restart must reload the newly saved identity.
+      const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+      if (epoch !== generation) return null;
+      if (!hasIdentity(authState.creds) && !pendingNumber) {
+        state.status = 'disconnected';
+        return null; // Do not open/restart unregistered sockets at service boot.
+      }
+      const client = makeWASocket({
+        auth: authState,
+        browser: Browsers.ubuntu('Chrome'),
+        syncFullHistory: false,
+        markOnlineOnConnect: false,
+        logger: silentLogger(),
+      });
+      current = client;
+      codeRequested = false;
+      client.ev.on('creds.update', () => {
+        if (current !== client) return;
+        credentialWrites = credentialWrites.then(() => saveCreds());
+        credentialWrites.catch(fail);
+      });
+      client.ev.on('connection.update', (update) => {
+        if (current !== client) return;
+        if (update.connection === 'connecting') {
+          state.status = pendingNumber ? 'pairing' : 'connecting';
+        }
+        if (update.qr && pendingNumber && !hasIdentity(client.authState.creds) && !codeRequested) {
+          codeRequested = true;
+          const number = pendingNumber;
+          client.requestPairingCode(number).then((code) => {
+            if (current !== client || hasIdentity(client.authState.creds)) return;
+            const clean = String(code || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
+            if (clean.length !== 8) throw new Error('WhatsApp returned an invalid pairing code.');
+            state.pairing_code = clean.slice(0, 4) + '-' + clean.slice(4);
+            state.pairing_code_at = new Date().toISOString();
+            state.status = 'pairing';
+            state.error = '';
+          }).catch((error) => {
+            if (current !== client) return;
+            current = null;
+            pendingNumber = '';
+            fail(error);
+            client.end(error);
+          });
+        }
+        if (update.connection === 'open') {
+          state.status = 'connected';
+          state.connected_at = new Date().toISOString();
+          state.error = '';
+          state.last_disconnect_code = null;
+          pendingNumber = '';
+          clearCode();
+          console.log('NiceBot connected. Owner: ' + OWNER_NUMBER);
+        }
+        if (update.connection === 'close') {
+          const error = update.lastDisconnect && update.lastDisconnect.error;
+          const code = error && error.output ? error.output.statusCode : undefined;
+          const registered = hasIdentity(client.authState.creds);
+          current = null;
+          clearCode();
+          state.connected_at = null;
+          state.last_disconnect_code = code || null;
+          console.warn('WhatsApp closed. Code: ' + code + '; saved identity: ' + registered);
+          // Successful linking deliberately closes with 515. Never wipe that identity.
+          if (code === DisconnectReason.restartRequired) {
+            pendingNumber = '';
+            state.status = 'connecting';
+            state.error = '';
+            scheduleRestart(500);
+            return;
+          }
+          const terminal = [DisconnectReason.loggedOut, DisconnectReason.badSession,
+            DisconnectReason.connectionReplaced, DisconnectReason.multideviceMismatch,
+            DisconnectReason.forbidden].filter((value) => value !== undefined).includes(code);
+          pendingNumber = '';
+          if (!terminal && registered) {
+            state.status = 'connecting';
+            state.error = 'WhatsApp connection closed (' + (code || 'unknown') + ') — reconnecting.';
+            scheduleRestart(4000);
+          } else {
+            state.status = 'disconnected';
+            state.error = code === DisconnectReason.loggedOut
+              ? 'WhatsApp rejected or logged out this session (401). Request a new code to start a clean session.'
+              : 'WhatsApp linking stopped (' + (code || 'unknown') + '). Request a new code; the previous code is no longer valid.';
+          }
+        }
+      });
+      attachMessageHandlers(client, () => current === client);
+      return client;
+    })();
+    try { return await starting; } finally { starting = null; }
+  }
+
+  async function pair(number) {
+    if (state.status === 'connected' || state.status === 'connecting' || (current && hasIdentity(current.authState.creds))) {
+      const error = new Error('This session is linked or finishing linking. Wait for the connection, or log out before pairing again.');
+      error.status = 409;
+      throw error;
+    }
+    if (pairOperation) {
+      if (pendingNumber !== number) {
+        const error = new Error('A pairing request is already in progress.');
+        error.status = 409;
+        throw error;
+      }
+      return pairOperation;
+    }
+    if (current && pendingNumber === number && state.pairing_code &&
+        Date.now() - Date.parse(state.pairing_code_at) < 90000) return;
+    pairOperation = (async () => {
+      await stop(false);
+      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+      pendingNumber = number;
+      state.owner_number = number;
+      state.status = 'pairing';
+      state.error = '';
+      state.last_disconnect_code = null;
+      await start();
+      for (let waited = 0; waited < 10000 && !state.pairing_code && state.status === 'pairing'; waited += 250) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+      }
+      if (state.status === 'disconnected') throw new Error(state.error || 'WhatsApp linking stopped.');
+    })();
+    try { await pairOperation; } finally { pairOperation = null; }
+  }
+
+  async function logout() {
+    await stop(true);
+    fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+    state.status = 'disconnected';
+    state.connected_at = null;
+    state.error = '';
+  }
+  return { start, pair, logout };
+}
+
+const connection = createWhatsAppConnection();
+
+function attachMessageHandlers(client, isCurrent) {
+  client.ev.on('messages.upsert', async (payload) => {
+    if (!isCurrent()) return;
     if (payload && payload.type === 'append') return; // skip replays of old messages after a reconnect
     const messages = (payload && payload.messages) || [];
     for (const message of messages) {
@@ -430,7 +536,8 @@ async function startSocket() {
         if (!text) continue;
         const reply = await replyFor(text);
         if (!reply) continue;
-        if (sock) await sock.sendMessage(jid, { text: reply });
+        if (!isCurrent()) return;
+        await client.sendMessage(jid, { text: reply });
         const trimmed = text.trim();
         logs.unshift({
           id: message.key.id,
@@ -446,8 +553,6 @@ async function startSocket() {
       } catch (error) {}
     }
   });
-
-  return sock;
 }
 
 const app = express();
@@ -484,51 +589,22 @@ app.post('/api/pair', async (req, res) => {
     return res.status(409).json({ error: 'This device is already linked. Log out first.' });
   }
   try {
-    pairingNumber = number;
-    pairingRequested = false;
-    state.owner_number = number;
-    state.pairing_code = '';
-    state.error = '';
-    state.status = 'pairing';
-    if (!sock) {
-      await startSocket();
-    }
-    // The code arrives on the next QR event, usually within a few seconds.
-    for (let waited = 0; waited < 12000 && !state.pairing_code; waited += 500) {
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-    if (state.pairing_code) {
-      res.json({ code: state.pairing_code, number: number, status: state.status });
-    } else {
-      res.json({
-        code: '',
-        number: number,
-        status: state.status,
-        notice: 'Contacting WhatsApp — your pairing code appears below in a few seconds.',
-      });
-    }
+    await connection.pair(number);
+    res.json({
+      code: state.pairing_code,
+      pairing_code_at: state.pairing_code_at,
+      number: number,
+      status: state.status,
+      notice: state.pairing_code ? '' : 'Waiting for WhatsApp. The code will appear when the connection is ready.',
+    });
   } catch (error) {
-    state.status = 'disconnected';
-    state.error = String((error && error.message) || error);
-    res.status(500).json({ error: state.error });
+    res.status(error.status || 500).json({ error: String(error.message || error) });
   }
 });
 
 app.post('/api/logout', async (req, res) => {
   try {
-    if (sock) {
-      try {
-        await sock.logout();
-      } catch (error) {}
-      sock = null;
-    }
-    try {
-      fs.rmSync(AUTH_DIR, { recursive: true, force: true });
-    } catch (error) {}
-    state.status = 'disconnected';
-    state.connected_at = null;
-    state.pairing_code = '';
-    state.error = '';
+    await connection.logout();
     res.json({ ok: true });
   } catch (error) {
     res.status(500).json({ error: String((error && error.message) || error) });
@@ -540,8 +616,13 @@ app.listen(PORT, () => {
   console.log('NiceBot service listening on http://localhost:' + PORT);
   fetchCommands();
   setInterval(fetchCommands, 60000);
-  startSocket().catch((error) => {
+  connection.start().catch((error) => {
     state.error = String((error && error.message) || error);
     console.error('Could not start the WhatsApp socket:', state.error);
   });
+});
+}
+main().catch((error) => {
+  console.error('Could not start NiceBot:', String(error.message || error));
+  process.exitCode = 1;
 });
