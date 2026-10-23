@@ -22,6 +22,7 @@ const path = require('path');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
+  fetchLatestBaileysVersion,
   DisconnectReason,
   Browsers,
 } = require('@whiskeysockets/baileys');
@@ -31,7 +32,7 @@ const PORT = Number(process.env.PORT || 3001);
 const BOT_TOKEN = process.env.BOT_TOKEN || '';
 const AUTH_DIR = process.env.AUTH_DIR || path.join(__dirname, 'auth_state');
 const LOG_FILE = path.join(__dirname, 'messages.json');
-const APP_ID = process.env.BASE44_APP_ID || '8ada598c7b57f36e7986e4ad';
+const APP_ID = process.env.BASE44_APP_ID || '6ada598c7b57f36e7986e4ad';
 const API_TOKEN = process.env.BASE44_API_TOKEN || 'b44u_8de97fd78cdbb18baf4e57c47039c8d997c501a19b3f3c0af4722def92f86f4b';
 const API_BASE = process.env.BASE44_API_BASE || 'https://app.base44.com';
 
@@ -47,6 +48,8 @@ const state = {
 let sock = null;
 let logs = [];
 let restarting = false;
+let pairingNumber = '';
+let pairingRequested = false;
 let commands = [];
 let commandsLoadedAt = null;
 
@@ -344,10 +347,33 @@ function scheduleRestart() {
   }, 4000);
 }
 
+// WhatsApp signals it is ready to pair by emitting a QR event — even in
+// pairing-code mode. Requesting the code exactly on that event (instead of
+// a fixed delay) is what prevents the 428 / connection-closed errors.
+async function askForPairingCode() {
+  try {
+    const code = await sock.requestPairingCode(pairingNumber);
+    const clean = String(code || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
+    state.pairing_code = clean.length === 8 ? clean.slice(0, 4) + '-' + clean.slice(4) : clean;
+    state.status = 'pairing';
+    state.error = '';
+    console.log('Pairing code for ' + pairingNumber + ': ' + state.pairing_code);
+  } catch (error) {
+    pairingRequested = false;
+    state.error = 'Could not get a pairing code — trying again on the next attempt.';
+    console.error('requestPairingCode failed:', String((error && error.message) || error));
+  }
+}
+
 async function startSocket() {
   const { state: authState, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+  let version;
+  try {
+    version = (await fetchLatestBaileysVersion()).version;
+  } catch (error) {}
   sock = makeWASocket({
     auth: authState,
+    version: version,
     printQRInTerminal: false,
     browser: Browsers.ubuntu('Chrome'),
     syncFullHistory: false,
@@ -364,6 +390,8 @@ async function startSocket() {
       state.connected_at = new Date().toISOString();
       state.pairing_code = '';
       state.error = '';
+      pairingNumber = '';
+      pairingRequested = false;
       console.log('NiceBot is connected as ' + state.owner_number);
     }
     if (update.connection === 'close') {
@@ -372,17 +400,27 @@ async function startSocket() {
         disconnect.error && disconnect.error.output ? disconnect.error.output.statusCode : undefined;
       state.status = 'disconnected';
       state.connected_at = null;
+      pairingRequested = false;
+      if (!sock) return;
       if (statusCode === DisconnectReason.loggedOut) {
-        state.error = 'This device was logged out of WhatsApp.';
+        state.error = 'This device was logged out of WhatsApp — clear the session and pair again.';
         sock = null;
+        try {
+          fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+        } catch (error) {}
       } else {
         state.error = 'Connection closed — reconnecting…';
         scheduleRestart();
       }
     }
+    if (update.qr && pairingNumber && !pairingRequested) {
+      pairingRequested = true;
+      askForPairingCode();
+    }
   });
 
   sock.ev.on('messages.upsert', async (payload) => {
+    if (payload && payload.type === 'append') return; // skip replays of old messages after a reconnect
     const messages = (payload && payload.messages) || [];
     for (const message of messages) {
       try {
@@ -446,22 +484,29 @@ app.post('/api/pair', async (req, res) => {
     return res.status(409).json({ error: 'This device is already linked. Log out first.' });
   }
   try {
-    if (!sock) await startSocket();
+    pairingNumber = number;
+    pairingRequested = false;
     state.owner_number = number;
-    state.status = 'pairing';
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-    let code;
-    try {
-      code = await sock.requestPairingCode(number);
-    } catch (firstError) {
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-      code = await sock.requestPairingCode(number);
-    }
-    const clean = String(code || '').replace(/[^a-z0-9]/gi, '').toUpperCase();
-    state.pairing_code = clean.length === 8 ? clean.slice(0, 4) + '-' + clean.slice(4) : clean;
+    state.pairing_code = '';
     state.error = '';
-    console.log('Pairing code for ' + number + ': ' + state.pairing_code);
-    res.json({ code: state.pairing_code, number: number, status: state.status });
+    state.status = 'pairing';
+    if (!sock) {
+      await startSocket();
+    }
+    // The code arrives on the next QR event, usually within a few seconds.
+    for (let waited = 0; waited < 12000 && !state.pairing_code; waited += 500) {
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    if (state.pairing_code) {
+      res.json({ code: state.pairing_code, number: number, status: state.status });
+    } else {
+      res.json({
+        code: '',
+        number: number,
+        status: state.status,
+        notice: 'Contacting WhatsApp — your pairing code appears below in a few seconds.',
+      });
+    }
   } catch (error) {
     state.status = 'disconnected';
     state.error = String((error && error.message) || error);
